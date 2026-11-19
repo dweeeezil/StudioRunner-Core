@@ -15,6 +15,10 @@ if (Test-Path "$repo\src\lib\model") {
     Copy-Item -Recurse "$repo\src\lib\model" "$work\src\lib\model"
 }
 
+# the LTC encoder (test_mixer_timecode checks the decoding against it)
+New-Item -ItemType Directory -Force "$work\src\sim" | Out-Null
+Copy-Item "$repo\src\sim\ltc_gen.py" "$work\src\sim\ltc_gen.py"
+
 function Run-Tests {
     Push-Location "$work\tools"
     $out = & python -m unittest @Tests 2>&1 | Out-String

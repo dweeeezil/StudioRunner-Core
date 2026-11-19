@@ -1276,6 +1276,200 @@ class MeterSourceFlag(unittest.TestCase):
         self.assertIn("decision M8", r.stderr)
 
 
+class TimecodeCase(ServerCase):
+    """The timecode display end to end, with the synthetic source (the
+    controller spec, section 8): subscribe over TCP, datagrams on a UDP socket."""
+
+    SERVER_ARGS = ["--timecode-source", "synthetic"]
+    SOURCE = "/mixer/set/system/timecodeSource"
+
+    def listener(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        s.settimeout(0.1)
+        self.addCleanup(s.close)
+        return s
+
+    def collect(self, sock, seconds):
+        from osc_codec import decode_packet
+        out, end = [], time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                data = sock.recv(65535)
+            except socket.timeout:
+                continue
+            for m in decode_packet(data):
+                self.assertEqual(m.address, "/mixer/timecode")
+                out.append(m.args)
+        return out
+
+    def running(self, link, sock, source):
+        """Select `source`, and the messages once it reports running."""
+        self.assertEqual(self.roundtrip(link, self.SOURCE, source), float(source))
+        link.send_message("/mixer/timecode/subscribe", [sock.getsockname()[1]])
+        return [a for a in self.collect(sock, 1.5) if a[1] == 2]
+
+
+class Timecode(TimecodeCase):
+    def test_the_config_offers_it(self):
+        c = self.tcp()
+        c.send_message("/mixer/get/system/config")
+        cfg = json.loads(c.read_message().args[0])
+        self.assertIn("timecode", cfg["capabilities"])
+        s = cfg["system"]["timecodeSource"]
+        self.assertEqual((s["type"], s["default"]), ("enum", 0.0))
+        self.assertEqual(s["options"], [float(v) for v in range(21)])
+        self.assertEqual(s["optionLabels"][:2] + s["optionLabels"][-1:], ["Off", "Analog 1", "AVB 8"])
+        self.assertEqual(len(s["optionLabels"]), 21)
+
+    def test_off_says_so(self):
+        c, u = self.tcp(), self.listener()
+        c.send_message("/mixer/timecode/subscribe", [u.getsockname()[1]])
+        got = self.collect(u, 1.2)
+        self.assertTrue(2 <= len(got) <= 4, len(got))              # twice a second
+        self.assertEqual({tuple(a[1:]) for a in got}, {(0, 0, 0, 0, 0, 0.0, 0)})
+        self.assertEqual([a[0] for a in got], list(range(len(got))))
+
+    def test_30_fps_frame_by_frame(self):
+        c, u = self.tcp(), self.listener()
+        got = self.running(c, u, 1)
+        self.assertGreater(len(got), 15)
+        self.assertEqual({(a[2], a[3], a[6], a[7]) for a in got}, {(1, 0, 30.0, 0)})
+        counts = [a[4] * 30 + a[5] for a in got]
+        steps = [b - a for a, b in zip(counts, counts[1:])]
+        self.assertEqual(steps.count(1), len(steps), steps)        # none doubled, none skipped
+
+    def test_drop_frame(self):
+        c, u = self.tcp(), self.listener()
+        got = self.running(c, u, 2)
+        self.assertTrue(got)
+        self.assertEqual((got[-1][2], got[-1][3], got[-1][7]), (0, 59, 1))
+        self.assertAlmostEqual(got[-1][6], 29.97, places=3)
+
+    def test_a_source_without_timecode(self):
+        c, u = self.tcp(), self.listener()
+        self.assertEqual(self.running(c, u, 5), [])
+
+    def test_the_source_is_synced_between_controllers(self):
+        a, b = self.tcp(), self.tcp()
+        a.send_message(self.SOURCE, [6.0])
+        self.assertEqual(b.read_message().args, [6.0])
+        self.assertEqual(self.get(b, "system/timecodeSource"), 6.0)
+
+    def test_a_source_it_doesnt_have_is_refused(self):
+        c = self.tcp()
+        for bad in (21.0, -1.0, 2.5, "USB 1"):
+            c.send_message(self.SOURCE, [bad])
+            m = c.read_message()
+            self.assertEqual((m.address, m.args[0]), ("/mixer/error", "system/timecodeSource"), bad)
+        self.assertEqual(self.get(c, "system/timecodeSource"), 0.0)
+
+    def test_malformed_subscribes_get_an_error_reply(self):
+        c = self.tcp()
+        for args in ([], ["9000"], [9000.5], [70000], [-1], [9000, 30], [float("nan")]):
+            c.send_message("/mixer/timecode/subscribe", args)
+            m = c.read_message()
+            self.assertEqual((m.address, m.args[0]), ("/mixer/error", "timecode/subscribe"), args)
+
+    def test_a_float_port_is_accepted(self):
+        c, u = self.tcp(), self.listener()
+        c.send_message("/mixer/timecode/subscribe", [float(u.getsockname()[1])])
+        self.assertTrue(self.collect(u, 0.3))
+        silent(self, c)
+
+    def test_port_0_and_closing_tcp_end_it(self):
+        c, u = self.tcp(), self.listener()
+        c.send_message("/mixer/timecode/subscribe", [u.getsockname()[1]])
+        self.assertTrue(self.collect(u, 0.3))
+        c.send_message("/mixer/timecode/subscribe", [0])
+        self.collect(u, 0.2)
+        self.assertEqual(self.collect(u, 0.8), [])
+        d, v = self.tcp(), self.listener()
+        d.send_message("/mixer/timecode/subscribe", [v.getsockname()[1]])
+        self.assertTrue(self.collect(v, 0.3))
+        d.close()
+        self.collect(v, 0.2)
+        self.assertEqual(self.collect(v, 0.8), [])
+
+    def test_snapshots_leave_the_source_alone(self):
+        c = self.tcp()
+        self.roundtrip(c, self.SOURCE, 3.0)
+        c.send_message("/mixer/snapshot/save", ["Gig"])
+        while c.read_message().address != "/mixer/snapshot/list":
+            pass
+        self.roundtrip(c, self.SOURCE, 4.0)
+        c.send_message("/mixer/snapshot/load", ["Gig"])
+        while True:
+            m = c.read_message()
+            self.assertNotEqual(m.address, self.SOURCE)
+            if m.address == "/mixer/snapshot/loaded":
+                break
+        self.assertEqual(self.get(c, "system/timecodeSource"), 4.0)
+
+    def test_the_time_is_never_stored(self):
+        c, u = self.tcp(), self.listener()
+        self.running(c, u, 1)
+        time.sleep(0.5)                                            # the store's batch delay
+        with open(os.path.join(self.dir, "state.json")) as f:
+            stored = json.load(f)
+        self.assertEqual(stored["system"]["timecodeSource"], 1.0)
+        self.assertEqual([k for k in stored["system"] if "imecode" in k], ["timecodeSource"])
+
+
+class TimecodeRestored(TimecodeCase):
+    STATE = {"system": {"deviceName": "mixer", "timecodeSource": 3.0}}
+
+    def test_the_stored_source_runs_after_a_power_cycle(self):
+        c, u = self.tcp(), self.listener()
+        self.assertEqual(self.get(c, "system/timecodeSource"), 3.0)
+        c.send_message("/mixer/timecode/subscribe", [u.getsockname()[1]])
+        got = [a for a in self.collect(u, 1.5) if a[1] == 2]
+        self.assertTrue(got)
+        self.assertEqual(got[-1][6], 25.0)
+
+
+class TimecodeStoredBadValue(TimecodeCase):
+    STATE = {"system": {"deviceName": "mixer", "timecodeSource": 99.0}}
+
+    def test_a_bad_stored_source_means_off(self):
+        c, u = self.tcp(), self.listener()
+        c.send_message("/mixer/timecode/subscribe", [u.getsockname()[1]])
+        self.assertEqual({a[1] for a in self.collect(u, 0.3)}, {0})
+        self.assertIn("ignored", self.log())
+
+
+class NoTimecode(ServerCase):
+    """No source (the simulator's default; a bitstream without the window): no
+    setting, no capability, and a subscribe is an unknown command, ignored."""
+
+    def test_nothing_is_offered(self):
+        c = self.tcp()
+        c.send_message("/mixer/get/system/config")
+        cfg = json.loads(c.read_message().args[0])
+        self.assertNotIn("timecode", cfg["capabilities"])
+        self.assertNotIn("timecodeSource", cfg["system"])
+
+    def test_the_setting_is_refused(self):
+        c = self.tcp()
+        c.send_message("/mixer/set/system/timecodeSource", [1.0])
+        self.assertEqual(c.read_message().address, "/mixer/error")
+
+    def test_a_subscribe_is_ignored(self):
+        c = self.tcp()
+        c.send_message("/mixer/timecode/subscribe", [9000])
+        silent(self, c)
+
+
+class TimecodeSourceFlag(unittest.TestCase):
+    def test_synthetic_refused_with_hw(self):
+        r = subprocess.run([sys.executable, os.path.join(HERE, "osc_mixer_server.py"),
+                            "--tcp-port", "1", "--udp-port", "2", "--hw",
+                            "--timecode-source", "synthetic"],
+                           cwd=HERE, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--timecode-source", r.stderr)
+
+
 class Ping(ServerCase):
     """F7, amendment H: /<name>/ping <int> -> /<name>/pong <int>, to the sender."""
 

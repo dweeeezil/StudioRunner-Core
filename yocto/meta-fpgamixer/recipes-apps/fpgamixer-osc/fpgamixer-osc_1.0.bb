@@ -21,6 +21,7 @@ SRC_URI = " \
     file://mixer_snapshots.py \
     file://mixer_inserts.py \
     file://mixer_eq.py \
+    file://mixer_timecode.py \
     file://fpgamixer_health.sh \
     file://fpgamixer-osc.service \
     file://fpgamixer-mdns.conf \
@@ -42,7 +43,8 @@ SYSTEMD_AUTO_ENABLE:${PN} = "enable"
 # LF8 (2026-10-31): mixer_inserts (re, dataclasses -> core); the server's
 # InsertWorker uses queue, which is python3-threading (manifest, checked
 # 2026-10-31: queue.py and _queue are not in core). mixer_eq (2026-11-17):
-# math only; the EQ driver: heapq -> core.
+# math only; the EQ driver: heapq -> core. mixer_timecode (2026-11-18):
+# collections, threading, time -> core.
 RDEPENDS:${PN} = "python3-core python3-io python3-json python3-mmap python3-threading"
 
 APPDIR = "${libdir}/fpgamixer"
@@ -55,7 +57,8 @@ do_install() {
     install -d ${D}${APPDIR}
     install -m 0644 ${S}/osc_mixer_server.py ${S}/osc_codec.py ${S}/osc_discovery.py \
         ${S}/mixer_params.py ${S}/mixer_state.py ${S}/mixer_hw.py ${S}/mixer_meters.py \
-        ${S}/mixer_snapshots.py ${S}/mixer_inserts.py ${S}/mixer_eq.py ${D}${APPDIR}/
+        ${S}/mixer_snapshots.py ${S}/mixer_inserts.py ${S}/mixer_eq.py \
+        ${S}/mixer_timecode.py ${D}${APPDIR}/
 
     # Hardening T4: the health summary (shell; mixer_hw.py health for the PL)
     install -d ${D}${bindir}

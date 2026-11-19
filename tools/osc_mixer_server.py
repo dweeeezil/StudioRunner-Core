@@ -121,6 +121,11 @@ made here so you can compare against the real firmware once it exists):
     snapshot/loaded; all under the ordering lock. save/store/delete are
     confirmed by a broadcast snapshot/list. The config lists
     "capabilities": ["snapshots"].
+  - Timecode (standard "Timecode", 2026-11-18): 'system/timecodeSource' picks
+    the I/O port the PL's LTC decoder listens to; '/<name>/timecode/subscribe
+    <port>' starts the UDP stream (mixer_timecode.TimecodeHub). The config
+    lists "timecode" in its capabilities. A bitstream without the window has
+    none of this.
   - I/O patch (standard "I/O patch", Phase 15): 'source' on inputChannel and
     'destination' on outputChannel, enums 0 = None, p + 1 = I/O port p
     (labels from mixer_hw.IO_PORTS: Analog 1-4, USB 1-8, AVB 1-8), each
@@ -204,6 +209,7 @@ import mixer_snapshots  # noqa: E402
 import mixer_inserts  # noqa: E402
 from mixer_inserts import INSERTS_MODULE, InsertRefused  # noqa: E402
 import mixer_eq  # noqa: E402
+import mixer_timecode  # noqa: E402
 
 DEVICE_NAME_KEY = "system/deviceName"  # as sent; requests may add a trailing slash
 
@@ -1189,6 +1195,12 @@ COUNT_SETTINGS = {"inputCount": "inputChannel", "busCount": "busChannel",
                   "outputCount": "outputChannel"}
 CONFIG_CHANGED = "config/changed"
 
+# The timecode display (standard "Timecode", 2026-11-18): which I/O port the
+# LTC decoder listens to, 0 = off, p + 1 = port p (the patch's convention).
+TIMECODE_SETTING = "timecodeSource"
+TIMECODE_PATH = "timecode/subscribe"
+TIMECODE = None   # mixer_timecode.TimecodeHub, or None: this mixer has no timecode (main)
+
 
 def system_settings(backends):
     """SYSTEM_SETTINGS, plus the channel counts when the mixer can have them:
@@ -1199,6 +1211,10 @@ def system_settings(backends):
         for name, zone in COUNT_SETTINGS.items():
             n = backends[zone].n
             settings[name] = ModuleSpec("int", min=1, max=n, default=n)
+    if TIMECODE is not None:
+        labels = io_port_labels()
+        settings[TIMECODE_SETTING] = ModuleSpec("enum", options=tuple(float(v) for v in range(len(labels) + 1)),
+                                                option_labels=("Off",) + tuple(labels), default=0.0)
     return settings
 
 
@@ -1278,6 +1294,8 @@ def reply_config(state, registry, reply_sock, via):
             body["inserts"] = {"maxPerChannel": INSERTS.k,
                                "types": list(INSERTS.pools),
                                "delayFrames": INSERTS.k + 1}
+        if TIMECODE is not None:          # spec: timecode_controller_spec_2026-11-18.md
+            body.setdefault("capabilities", []).append("timecode")
         text = json.dumps(body, separators=(",", ":"), allow_nan=False)
         registry.send(reply_sock, encode_message(f"/{state.mixer_name}/set/{CONFIG_PATH}", [text]))
     log(f"    [{via}] config sent ({len(text)} bytes, {len(body['values'])} value(s))")
@@ -1386,6 +1404,8 @@ def apply_set(tail, value, state, registry, reply, via):
             return send_error(reply, state, param.path, f"can't store: {conflict}", via)
         if param.zone == SYSTEM_ZONE and param.index in COUNT_SETTINGS:
             return set_count(param, applied, state, registry, via)
+        if param.zone == SYSTEM_ZONE and param.index == TIMECODE_SETTING:
+            return set_timecode_source(param, applied, state, registry, via)
         if param.module == INSERTS_MODULE:
             return set_inserts(param, applied, state, registry, reply, via)
         why = free_slot_refusal(param)
@@ -1515,6 +1535,17 @@ def set_count(param, applied, state, registry, via):
                         for z, s in MODEL.zones.items()))
 
 
+def set_timecode_source(param, applied, state, registry, via):
+    """The timecode source (standard "Timecode"), under the ordering lock:
+    store it, point the decoder at it if it changed, echo to every controller."""
+    old = current_value(param, state)
+    state.set(param.path, applied)
+    if applied != old:
+        TIMECODE.select(int(applied))
+        log(f"    [{via}] timecode source = {int(applied)}")
+    registry.broadcast(encode_message(f"/{state.mixer_name}/set/{param.path}", [applied]))
+
+
 def handle_devicename_change(new_name, state, registry, reply, via):
     """A rename. Accepted: broadcast under the old name, then the new name
     applies (the alias keeps working). Refused (D33 rules): the sender alone
@@ -1585,6 +1616,8 @@ def handle_tcp_message(msg, state, registry, reply_sock, via):
         handle_ping(msg.args, state, reply, via)
     elif kind == "meter" and "/".join(split_path(tail) or ()) == "subscribe":
         handle_meter_subscribe(msg.args, state, reply, reply_sock, via)
+    elif kind == "timecode" and TIMECODE is not None and "/".join(split_path(tail) or ()) == "subscribe":
+        handle_timecode_subscribe(msg.args, state, reply, reply_sock, via)
     elif kind == "snapshot":
         handle_snapshot(tail, msg.args, state, registry, reply, via)
     else:
@@ -1636,6 +1669,22 @@ def handle_meter_subscribe(args, state, reply, conn, via):
     except OSError:
         return
     METER_HUB.subscribe(conn, ip, port, rate, mixer_meters.zones_from_mask(mask, METER_HUB.available))
+
+
+def handle_timecode_subscribe(args, state, reply, conn, via):
+    """Standard "Timecode": /<name>/timecode/subscribe <port>, one integer (OSC
+    i, or f with an integral value), 1..65535; 0 unsubscribes. The stream goes
+    to the TCP peer's address. Anything else gets an error reply."""
+    port = args[0] if len(args) == 1 else None
+    if isinstance(port, float) and math.isfinite(port) and port.is_integer():
+        port = int(port)
+    if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+        return send_error(reply, state, TIMECODE_PATH, "needs one integer: the UDP port, 0 to unsubscribe", via)
+    try:
+        ip = conn.getpeername()[0]
+    except OSError:
+        return
+    TIMECODE.subscribe(conn, ip, port)
 
 
 SNAPSHOTS = None   # mixer_snapshots.SnapshotStore (main)
@@ -1983,6 +2032,8 @@ def handle_tcp_client(conn, addr, state, registry):
         registry.remove(conn)
         if METER_HUB is not None:
             METER_HUB.drop(conn)     # "Closing the TCP connection ends the subscription"
+        if TIMECODE is not None:
+            TIMECODE.drop(conn)
         try:
             conn.close()
         except OSError:
@@ -2080,6 +2131,41 @@ def build_meter_source(use_hw, kind, backends, state):
     return None
 
 
+def build_timecode_source(use_hw, kind):
+    """The timecode display's source, or None. With use_hw the PL's window; a
+    bitstream without it, or one that doesn't match, simply has no timecode: a
+    display must never stop the mixer from starting. Without, the synthetic
+    source if asked for (never on hardware)."""
+    if use_hw:
+        import mixer_hw
+        try:
+            w = mixer_hw.open_window("timecode")
+        except (RuntimeError, OSError) as e:
+            log(f"No timecode ({e.__class__.__name__}: a bitstream without the window)")
+            return None
+        if w.ports != len(mixer_hw.IO_PORTS):
+            log(f"No timecode: the window has {w.ports} ports, mixer_hw.IO_PORTS lists {len(mixer_hw.IO_PORTS)}")
+            return None
+        log(f"PL window 'timecode' at 0x{w.base:08x}: {w.describe()}")
+        return mixer_timecode.HardwareTimecodeSource(w)
+    if kind == "synthetic":
+        log("Timecode: SYNTHETIC source (--timecode-source synthetic; for tests, never on hardware)")
+        return mixer_timecode.SyntheticTimecodeSource()
+    return None
+
+
+def restore_timecode_source(state):
+    """At startup: the stored source into the decoder (absent or refused: off)."""
+    spec = MODEL.system[TIMECODE_SETTING]
+    stored = state.get(f"{SYSTEM_ZONE}/{TIMECODE_SETTING}", default=None)
+    value, why = spec.apply(stored) if stored is not None else (spec.default_value(), None)
+    if why is not None:
+        log(f"    {SYSTEM_ZONE}/{TIMECODE_SETTING}: stored {stored!r} ignored ({why})")
+        value = spec.default_value()
+    TIMECODE.select(int(value))
+    log(f"Timecode: source {int(value)}")
+
+
 def seed_inserts(state):
     """At startup: every channel's stored chain into INSERTS (entries that
     can't be honoured are dropped and the store brought into line), and the
@@ -2109,7 +2195,7 @@ def seed_inserts(state):
 
 
 def main():
-    global VERBOSE, MODEL, FIRMWARE, ADVERTISER, METER_HUB, SNAPSHOTS, INSERTS
+    global VERBOSE, MODEL, FIRMWARE, ADVERTISER, METER_HUB, SNAPSHOTS, INSERTS, TIMECODE
     p = argparse.ArgumentParser(description="Reference/simulator server for the FPGA mixer OSC protocol.")
     p.add_argument("--host", default="0.0.0.0", help="address to bind (default: all interfaces)")
     p.add_argument("--tcp-port", type=int, required=True)
@@ -2158,10 +2244,16 @@ def main():
                    help="without --hw: synthetic = meters that follow each channel's level "
                         "(tests, the simulator); none = no meters (default). With --hw the "
                         "PL's meter windows are used if the bitstream has them")
+    p.add_argument("--timecode-source", choices=("none", "synthetic"), default="none",
+                   help="without --hw: synthetic = a different test timecode on each source "
+                        "(tests, the simulator); none = no timecode (default). With --hw the "
+                        "PL's decoder is used if the bitstream has it")
     args = p.parse_args()
     VERBOSE = args.verbose
     if args.hw and args.meter_source != "none":
         p.error("--meter-source is for the simulator; with --hw the meters are the PL's (decision M8)")
+    if args.hw and args.timecode_source != "none":
+        p.error("--timecode-source is for the simulator; with --hw the timecode is the PL's")
 
     state = MixerState(args.mixer_name, args.state_file or None, log=log)
     snapshot_dir = args.snapshot_dir
@@ -2172,6 +2264,11 @@ def main():
     BACKENDS.update(build_backends(args.hw, args.matrix_size, bus_layer=not args.no_bus_layer,
                                    identity_from=args.identity_from, patch=not args.no_patch))
     INSERTS = build_inserts(args.hw, BACKENDS, enabled=not args.no_inserts)
+    timecode_source = build_timecode_source(args.hw, args.timecode_source)
+    if timecode_source is not None:             # before the model: it adds a system setting
+        timecode_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        TIMECODE = mixer_timecode.TimecodeHub(timecode_source, timecode_sock.sendto,
+                                              lambda: state.mixer_name, log=log)
     MODEL = build_model(BACKENDS, system_settings(BACKENDS))
     counts = counts_of(state, MODEL.system)
     apply_topology(counts, state, push=False)   # before the first push: hidden channels never sound
@@ -2200,6 +2297,10 @@ def main():
             METER_HUB.set_visible(counts)
         threading.Thread(target=METER_HUB.run, daemon=True).start()
         log(f"Meters: {', '.join(f'{z} ({n})' for z, n in source.zones().items())}")
+
+    if TIMECODE is not None:
+        restore_timecode_source(state)
+        threading.Thread(target=TIMECODE.run, name="timecode", daemon=True).start()
 
     # systemd stops the service with SIGTERM: turn it into a normal exit so
     # the finally-block writes any batched, not-yet-saved state.

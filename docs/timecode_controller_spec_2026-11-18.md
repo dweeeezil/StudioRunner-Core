@@ -4,7 +4,7 @@
 
 **Background, not needed to implement:** `timecode_proposal_2026-11-18.md`. The mixer decodes LTC from one input port. The user picks the port, and the controller shows the time.
 
-**Firmware state:** the contract below is fixed, but the firmware isn't built yet. Until it is, develop against `MockDevice` (§8).
+**Firmware state:** the reference server implements this contract, with a simulated timecode source (§8). The board's image with the decoder isn't built yet.
 
 ---
 
@@ -90,7 +90,7 @@ Example, 01:02:03;04 at 29.97 drop-frame:
 | `minutes` | int | 0–59 |
 | `seconds` | int | 0–59 |
 | `frames` | int | 0 to the rate's last frame |
-| `fps` | float | Exactly one of 23.976, 24, 25, 29.97, 30. 0 only if no timecode has been decoded yet |
+| `fps` | float | One of 23.976, 24, 25, 29.97, 30, as a float32, so compare with a small tolerance. 0 only if no timecode has been decoded yet |
 | `dropFrame` | int | 1 = drop-frame. Only ever 1 with `fps` 29.97 |
 
 | `state` | Name | Time fields | Show |
@@ -102,7 +102,7 @@ Example, 01:02:03;04 at 29.97 drop-frame:
 **Timing:**
 - While running: one message per decoded frame.
 - Otherwise: two messages a second, so a lost datagram corrects itself.
-- After timecode starts, `state` becomes 2 about half a second later, once the mixer has measured the rate. So in state 2, `fps` is always valid.
+- After timecode starts on a newly chosen source, `state` becomes 2 about half a second later, once the mixer has measured the rate. So in state 2, `fps` is always valid. When the same timecode stops and resumes, `state` returns to 2 at once.
 - After timecode stops, `state` becomes 1 within about 100 ms.
 
 **Rules for the receiver:**
@@ -180,7 +180,7 @@ Apply the offset in states 1 and 2, so the display doesn't jump when timecode st
 
 **In `MockDevice`:** add `system/timecodeSource`, the subscribe handling and a generator, so demo mode shows a running clock.
 
-**On the reference server (arrives with the firmware's server step):**
+**On the reference server** (run it from the repo's `tools/` folder):
 
 ```bash
 python3 osc_mixer_server.py --tcp-port 8000 --udp-port 8001 --timecode-source synthetic

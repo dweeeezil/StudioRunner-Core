@@ -56,6 +56,8 @@ As a bring-up CLI, on the board:
                                               # (Phase 15; read only)
     python3 mixer_hw.py inserts               # the insert router's tables, decoded,
                                               # and the pools (LF8; read only)
+    python3 mixer_hw.py timecode              # the source, the flags and the last
+                                              # frame decoded (read only)
     python3 mixer_hw.py link [seconds]        # PS<->PL link counters (Phase 8);
                                               # with seconds: deltas and rates
     python3 mixer_hw.py link2 [seconds]       # the same for link #2 (Phase 9
@@ -643,6 +645,50 @@ class MediaClockSteerHW(RegWindow):
         return self.ppm_for_rate(self.rd(self.REG_RATE))
 
 
+class TimecodeHW(RegWindow):
+    """The timecode window (src/rtl/timecode_regs_axil.sv, 2026-11-18): one
+    I/O port into an LTC decoder. CONFIG = [7:0] I/O ports. SOURCE = 0 off,
+    p + 1 = port p. The rest is read-only, one snapshot per audio frame."""
+
+    ID = 0x5443_5001
+    REG_SOURCE = REG_COEF0 + 0x00
+    REG_LOW = REG_COEF0 + 0x04
+    REG_HIGH = REG_COEF0 + 0x08
+    REG_FRAMES = REG_COEF0 + 0x0C
+    REG_FRAME_SAMPLES = REG_COEF0 + 0x10
+    REG_FLAGS = REG_COEF0 + 0x14
+    REG_SNAPSHOTS = REG_COEF0 + 0x18
+
+    def __init__(self, base, dev="/dev/mem"):
+        super().__init__(base, dev)
+        self.ports = self.config & 0xFF
+
+    def describe(self):
+        return f"timecode, {self.ports} I/O ports"
+
+    def source(self):
+        return self.rd(self.REG_SOURCE)
+
+    def set_source(self, source):
+        self.wr(self.REG_SOURCE, source)
+
+    def read_frame(self):
+        """(frames, low, high, frame_samples, signal, locked), one whole frame:
+        it takes several reads, so they are repeated if a new frame landed."""
+        for _ in range(5):
+            frames = self.rd(self.REG_FRAMES)
+            low, high = self.rd(self.REG_LOW), self.rd(self.REG_HIGH)
+            samples, flags = self.rd(self.REG_FRAME_SAMPLES), self.rd(self.REG_FLAGS)
+            if self.rd(self.REG_FRAMES) == frames:
+                break
+        return frames, low, high, samples, bool(flags & 1), bool(flags & 2)
+
+    def status(self):
+        frames, _low, _high, samples, signal, locked = self.read_frame()
+        return {"source": self.source(), "signal": signal, "locked": locked,
+                "frames": frames, "frame_samples": samples}
+
+
 # name -> (physical base, class). Mirrors assign_bd_address; see ADDRESS MAP.
 # (The Audio Formatter at 0x8010_0000 is driver-owned, not listed here.)
 WINDOWS = {
@@ -669,6 +715,8 @@ WINDOWS = {
     # LF8 (2026-10-31): the insert router and its pools
     "insert":    (0x8000_F000, InsertRouterHW),
     "gainpool":  (0x8001_0000, GainPoolHW),
+    # 2026-11-18: the timecode display
+    "timecode":  (0x8001_1000, TimecodeHW),
     # 2026-11-17: the EQ, 8 KB (0x8001_2000 .. 0x8001_3FFF)
     "eqpool":    (0x8001_2000, EqPoolHW),
 }
@@ -890,6 +938,21 @@ def _main(argv):
         for typ, name in POOLS:
             pw = open_window(name)
             print(pw.describe())
+        return 0
+
+    if cmd == "timecode":
+        # 2026-11-18: read only; the OSC server owns SOURCE
+        import mixer_timecode
+        tc = open_window("timecode")
+        print(tc.describe())
+        src = tc.source()
+        print(f"source  {src}  {'Off' if src == 0 else IO_PORTS[src - 1] if src <= len(IO_PORTS) else '?'}")
+        frames, low, high, samples, signal, locked = tc.read_frame()
+        print(f"signal  {'yes' if signal else 'no'}   locked  {'yes' if locked else 'no'}")
+        t = mixer_timecode.decode_ltc(low, high)
+        when = "(not a valid time)" if t is None else (
+            f"{t.hours:02d}:{t.minutes:02d}:{t.seconds:02d}{';' if t.drop else ':'}{t.frames:02d}")
+        print(f"last    {when}   frames decoded {frames}, last frame {samples} samples")
         return 0
 
     if cmd == "level" and len(argv) == 5:

@@ -1,6 +1,6 @@
 # Proposal: LTC timecode display (2026-11-18)
 
-**State:** plan approved (§8, the user, 2026-11-18). **Step A done (§9); next: step B.** Nothing is on the board or wired into the top yet. The controller's spec is `timecode_controller_spec_2026-11-18.md`.
+**State:** plan approved (§8, the user, 2026-11-18). **Steps A, B and C done (§9, §10, §11); next: step E, the image.** Bitstream `tc1` is built and not on the board. The app (step D) is the user's. The controller's spec is `timecode_controller_spec_2026-11-18.md`.
 
 **Goal:** the user picks an input port in the app, and the app shows the timecode arriving on that port. It is meant for an upcoming demo, so the plan favours low risk over features.
 
@@ -158,7 +158,7 @@ Each step ends with a check-in. The feature can be dropped after any of them, an
 3. Play the 30 fps test WAV from the Mac into a USB port. Pick that port in the app: the time runs and matches the file.
 4. Repeat with the 25 fps and 29.97 drop-frame files.
 5. Stop the file: the readout holds and dims. Play it again: it recovers.
-6. **Recommended before the demo:** one 5-minute T1 USB → USB null test on the new image. It is the direct proof that the rebuild left the audio path bit-exact. The rest of the checks stay in the batch test (`eq_proposal` §7.9).
+6. **Recommended before the demo:** one 5-minute T1 USB → USB null test on the new image, **with a flat EQ inserted in the path**. It is the direct proof that the rebuild left the audio path bit-exact, and it exercises the insert tables that synthesized differently (§10). The rest of the checks stay in the batch test (`eq_proposal` §7.9).
 
 ## 7. Risks
 
@@ -201,3 +201,76 @@ Each step ends with a check-in. The feature can be dropped after any of them, an
 - The first mutant run left one survivor: a damaged 1 could be read as a 0, and the tests had no such case. The decoder was right; the "damaged bit" segment now proves it.
 
 **Not checked yet:** real LTC from real equipment. The vectors come from our own encoder, written to the standard. The bench (§6) is the first test against another generator, if the WAV is replaced by one from a DAW.
+
+## 10. Step B results (2026-11-18)
+
+**Built:**
+- `src/rtl/timecode_regs_axil.sv`, the window, as in §2.2;
+- `fpgamixer_top.sv`: the port and one instance, reading `io_in`;
+- `create_project.tcl`: `M_AXI_TIMECODE` on `ctrl_smc2` at 0x8001_1000, 4 KB;
+- `src/sim/tb_timecode_regs.sv` (target `tcregs`), `scripts/mutants/timecode_regs.json`, and new checks in `tb_top_windows`.
+
+**Simulation:**
+
+| Check | Result |
+|---|---|
+| FPGAmixer regression | **20 / 20 PASS.** Nine stopped on Defender's "child exe not found" and passed on rerun |
+| `tcregs`: the right port, a clean switch between ports, whole frames across the clocks, off, values above the port count | **PASS** |
+| `topwin`: the window's ID and CONFIG, ports 0, 7 and 19 through the real port map, every output unchanged afterwards | **PASS** |
+| Mutants of the window | **13 / 13 killed** |
+
+**Vivado `tc1`, against the gate of §5:**
+
+| Item | `eq2` | `tc1` | Gate |
+|---|---|---|---|
+| WNS | 3.522 ns | **3.715 ns** | pass |
+| WHS | 0.010 ns | **0.010 ns** | pass |
+| Failing paths | 0 | **0** | pass |
+| Critical warnings | 0 | **0** | pass |
+| Methodology | PASS | **PASS** | pass |
+| DSPs | 42 | **42** | pass |
+| BRAM tiles | 33 | **33** | pass |
+| RAM report | | **96 of 99 RAMs identical; 3 differ** | **see below** |
+| LUTs | 30,290 | 30,904 (+614) | |
+| Registers | 40,857 | 41,656 (+799) | |
+
+**The RAM difference.** The gate asked for an unchanged report, so this is recorded rather than passed silently. The reference is a fresh synthesis of the committed `eq2` sources, compared RAM by RAM.
+- **What differs:** three of the insert router's table copies (`u_insert_regs/u_bank`, ports 0–2) are **256 × 18** in `tc1` and 256 × 14 in `eq2`.
+- **Why it is safe:** 18 bits is the width the RTL declares. `eq2`'s synthesis had trimmed the 4 bits that those RETURN readers never use (`eq_proposal` §7.7 notes this trim as correct). `tc1` keeps them.
+- **How it differs from the `eq1` fault:** that one stored *fewer* bits than the block needed. This stores all of them. The BRAM count doesn't change.
+- **The check that covers it:** the null test of §6 with an insert in its path, because these tables steer every insert.
+
+**Clock crossings:** all 155 new crossings are the two `coef_bank_handoff`s, and all 155 carry the scoped datapath-only limit. The report's CDC-1 count is 1,800 in both builds, so nothing new appears in that class.
+
+**The address map:** the XSA's `ps_sys.hwh` has `M_AXI_TIMECODE` at 0x8001_1000 .. 0x8001_1FFF. The bitstream's MD5 is `43983464c6112d7852b772bc725a7595`.
+
+**Not run:** the window block on its synthesized netlist (the decoder was, §9), and anything on the board.
+
+## 11. Step C results (2026-11-18)
+
+**Built:**
+- `tools/mixer_timecode.py`: the LTC digits, the frame arithmetic, the rate, the tracker, the sources and `TimecodeHub`;
+- `tools/mixer_hw.py`: `TimecodeHW`, the window at 0x8001_1000, and `mixer_hw.py timecode` for the bench;
+- `tools/osc_mixer_server.py`: `system/timecodeSource`, `timecode/subscribe`, the `"timecode"` capability, the source restored at boot, and `--timecode-source synthetic`;
+- the `fpgamixer-osc` recipe installs the new file.
+
+**How it stays out of the way:**
+- The decoder's thread polls only while a controller is subscribed, and doesn't read the window while the source is Off.
+- The time is never stored, and the stream never takes the TCP ordering lock. A test checks that only the source setting reaches the state file.
+- A bitstream without the window, or a window that doesn't match, leaves the mixer running without timecode.
+
+**Changed from the plan:** the server polls at 60 Hz, not 30, so a 30 fps source is seen frame by frame. When the same timecode stops and resumes, the display returns to running at once.
+
+**Checked:**
+
+| Check | Result |
+|---|---|
+| New tests | **66 pass** (47 unit tests of the module and window, the rest over real TCP and UDP) |
+| The whole Python suite on Windows | 514 tests: **no new failures.** The 7 errors are the `MediaClock` tests that need Linux's `os.O_SYNC`, and they failed before this work |
+| Decoding against the testbenches' independent encoder | **PASS** |
+| The controller spec's 11 frame-offset vectors | **PASS** |
+| Mutants of the server code | **47 / 47 killed** |
+
+The first mutant run left three survivors, all gaps in the tests and none in the code: two needed LTC's flag bits set beside the minute and hour digits, and one needed a new source to measure its own rate. Tests were added for each.
+
+**Not run:** the `/dev/mem` path of `TimecodeHW` (only the board has it; its register logic is tested on a fake window), the Linux-only tests in `test_mixer_hw`, and anything on the board.
