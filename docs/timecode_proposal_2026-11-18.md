@@ -1,6 +1,6 @@
 # Proposal: LTC timecode display (2026-11-18)
 
-**State:** plan approved (§8, the user, 2026-11-18). **Steps A, B and C done (§9, §10, §11); next: step E, the image.** Bitstream `tc1` is built and not on the board. The app (step D) is the user's. The controller's spec is `timecode_controller_spec_2026-11-18.md`.
+**State:** plan approved (§8, the user, 2026-11-18). **Steps A, B and C done (§9, §10, §11); the image `tc1-timecode-20261119` is built and checked (§12). Next: the user's bench, §12.2.** Nothing has run on the board yet. The app (step D) is the user's. The controller's spec is `timecode_controller_spec_2026-11-18.md`.
 
 **Goal:** the user picks an input port in the app, and the app shows the timecode arriving on that port. It is meant for an upcoming demo, so the plan favours low risk over features.
 
@@ -274,3 +274,52 @@ Each step ends with a check-in. The feature can be dropped after any of them, an
 The first mutant run left three survivors, all gaps in the tests and none in the code: two needed LTC's flag bits set beside the minute and hour digits, and one needed a new source to measure its own rate. Tests were added for each.
 
 **Not run:** the `/dev/mem` path of `TimecodeHW` (only the board has it; its register logic is tested on a fake window), the Linux-only tests in `test_mixer_hw`, and anything on the board.
+
+## 12. The image (2026-11-19 UTC)
+
+### 12.1 Built and checked
+
+**The SDT:** `build/sdt` is `eq2`'s (kept as `build/sdt.eq2`, on the VM `~/edf/sdt.eq2`) with only what one more window changes, the method of `eq_proposal` §7.5, because `sdtgen` was blocked by Device Guard:
+- the bitstream `fpgamixer_tc1.bit` from the XSA, MD5 `43983464…`;
+- `pl.dtsi`: `firmware-name` `fpgamixer_tc1.bit.bin`;
+- `pcw.dtsi`: the node `M_AXI_TIMECODE@80011000`, reg `0x1000`;
+- `system-top.dts`: the window's line in each of the four `ranges` lists.
+
+The XSA's six `psu_init` files are byte-identical to `eq2`'s, and its address map differs from `eq2`'s by that one window.
+
+**The image:** `build/sd/tc1-timecode-20261119.wic.xz`, 109,425,420 bytes, MD5 `8d1140124cac8901489171b521d96996`, the same on both ends, `xz -t` OK. Built on `edfvm` with the layer at `a1614d1`: 15,107 tasks, all succeeded, 7 min, the same warnings as `eq2`.
+
+**Checked inside the `.wic`:**
+- `boot.bin` in the boot partition carries `tc1`'s bitstream and not `eq2`'s;
+- `system.dtb` and `u-boot.dtb` both have `M_AXI_TIMECODE@80011000` and `firmware-name` `fpgamixer_tc1.bit.bin`;
+- the rootfs `VERSION` is `a1614d1`, and the 11 Python files of the server match the commit byte for byte, `mixer_timecode.py` included;
+- `p15e`'s fixes are present: the gadget's `REQ_NUMBER=8`, PAUSE off, the journal mount.
+
+### 12.2 The bench (the user; the board at `ssh amd-edf@10.0.0.2`)
+
+**Before flashing:** use a **second SD card**, and keep the `eq2` card untouched. A new card starts blank, with nothing patched, so save the mix first: store it from the app as a snapshot file, or note the patch.
+
+1. **Flash and boot** `tc1-timecode-20261119.wic.xz`. If the Ethernet LEDs go dark after a second, do a full power-off for about 10 s. Restore the mix.
+2. **The board check:**
+   ```bash
+   sudo python3 /usr/lib/fpgamixer/mixer_hw.py timecode
+   ```
+   It prints `timecode, 20 I/O ports` and `source 0 Off`.
+3. **The audio path, the check that matters most before the demo.** Set up the channel-20 path (`hardening_status_2026-10-10.md`), insert a flat `eq` on input 20, and run on the Mac:
+   ```bash
+   python3 loopback_null_test.py --device "Topology Control" --out 8 --in 8 --minutes 5
+   ```
+   PASS means `errors 0, slips 0, losses 0`.
+4. **Timecode, without the app.** Play `build/ltc_wav/ltc_30fps_01h.wav` from the Mac into USB 1 (Topology Control output 1, unpatched), then on the board select USB 1 (source 5):
+   ```bash
+   python3 -c "import sys,socket; sys.path.insert(0,'/usr/lib/fpgamixer'); from osc_codec import encode_message as e; socket.socket(socket.AF_INET,socket.SOCK_DGRAM).sendto(e('/mixer/set/system/timecodeSource',[5.0]),('127.0.0.1',8001))"
+   ```
+   ```bash
+   sudo python3 /usr/lib/fpgamixer/mixer_hw.py timecode
+   ```
+   It prints `signal yes`, `locked yes`, a last frame of 1600 samples, and a time that matches the file's position after 01:00:00:00.
+5. **The other rates:** `ltc_25fps_01h.wav` (1920 samples) and `ltc_2997df_01h.wav` (1601 or 1602 samples, a `;` before the frames).
+6. **LTC from your DAW or another generator:** the first test against an encoder other than ours.
+7. **With the app:** the picker, the readout, stop and start, and a controller reconnecting.
+
+**After the bench:** step 3's result decides whether `tc1` or `eq2` goes to the demo.
