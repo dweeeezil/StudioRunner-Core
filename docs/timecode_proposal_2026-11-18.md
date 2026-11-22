@@ -1,6 +1,6 @@
 # Proposal: LTC timecode display (2026-11-18)
 
-**State:** plan approved (§8, the user, 2026-11-18). **Steps A, B and C done (§9, §10, §11); the image `tc1-timecode-20261119` is built and checked (§12). Next: the user's bench, §12.2.** Nothing has run on the board yet. The app (step D) is the user's. The controller's spec is `timecode_controller_spec_2026-11-18.md`.
+**State: COMPLETE, UNTESTED (the user, 2026-11-22).** Steps A–C are built, the image is `tc1-timecode-20261119`, and the user reports that everything works on the board. The formal bench (§12.2) has not been run (§12.3). The app (step D) is the user's. The controller's spec is `timecode_controller_spec_2026-11-18.md`.
 
 **Goal:** the user picks an input port in the app, and the app shows the timecode arriving on that port. It is meant for an upcoming demo, so the plan favours low risk over features.
 
@@ -323,3 +323,19 @@ The XSA's six `psu_init` files are byte-identical to `eq2`'s, and its address ma
 7. **With the app:** the picker, the readout, stop and start, and a controller reconnecting.
 
 **After the bench:** step 3's result decides whether `tc1` or `eq2` goes to the demo.
+
+### 12.3 Status: complete, untested (the user, 2026-11-22)
+
+The user: *"everything works. I have not run tests yet though."*
+
+**Verified:**
+- in simulation: the decoder bit-exact against an independent encoder, as RTL and as Vivado's netlist; the window; the whole-top test; mutants 25/25, 13/13 and 47/47;
+- the image's contents (§12.1);
+- on the board, informally: the user's use of `tc1`.
+
+**Not yet run (§12.2):**
+1. the board check (`mixer_hw.py timecode`);
+2. **the null test with a flat EQ in the path**, the check that the rebuild left the audio bit-exact and that the insert tables that synthesized differently (§10) are right;
+3. the test WAVs at each rate, and LTC from another generator.
+
+**Until they pass:** `p15e` stays the last formally tested baseline, as for the EQ (`eq_proposal` §7.9).
